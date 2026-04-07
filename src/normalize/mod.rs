@@ -1,3 +1,5 @@
+//! Chat export format detection and normalization to `> user\nresponse` transcript format.
+
 pub mod chatgpt;
 pub mod claude_ai;
 pub mod claude_code;
@@ -85,4 +87,46 @@ pub fn messages_to_transcript(messages: &[(&str, &str)]) -> String {
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_to_transcript_pairs() {
+        let msgs = vec![("user", "hello"), ("assistant", "hi there")];
+        let result = messages_to_transcript(&msgs);
+        assert!(result.contains("> hello"));
+        assert!(result.contains("hi there"));
+    }
+
+    #[test]
+    fn messages_to_transcript_user_only() {
+        let msgs = vec![("user", "question")];
+        let result = messages_to_transcript(&msgs);
+        assert!(result.contains("> question"));
+    }
+
+    #[test]
+    fn messages_to_transcript_empty() {
+        let msgs: Vec<(&str, &str)> = vec![];
+        let result = messages_to_transcript(&msgs);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn normalize_passthrough_with_markers() {
+        // Text with >= 3 lines starting with > should pass through
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("test.txt");
+        std::fs::write(
+            &path,
+            "> hello\nresponse\n\n> second\nreply\n\n> third\nanother",
+        )
+        .expect("write test file");
+        let result = normalize(&path).expect("normalize");
+        assert!(result.contains("> hello"));
+        // TempDir auto-cleans up when dropped
+    }
 }

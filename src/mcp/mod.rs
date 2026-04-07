@@ -1,3 +1,5 @@
+//! MCP server — JSON-RPC 2.0 over stdio exposing palace tools.
+
 pub mod protocol;
 pub mod tools;
 
