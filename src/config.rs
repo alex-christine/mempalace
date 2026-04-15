@@ -31,13 +31,22 @@ fn default_collection_name() -> String {
     "mempalace_drawers".to_string()
 }
 
-/// Returns ~/.mempalace/
+/// Returns the mempalace config directory.
+///
+/// Resolution order:
+///   1. `MEMPALACE_DIR` env var — explicit user, container, or test override.
+///   2. `~/.mempalace` — default.
 pub fn config_dir() -> PathBuf {
-    dirs_fallback().join(".mempalace")
+    if let Ok(env_path) = std::env::var("MEMPALACE_DIR")
+        && !env_path.is_empty()
+    {
+        return PathBuf::from(env_path);
+    }
+    home_dir().join(".mempalace")
 }
 
-/// Returns the user's home directory.
-fn dirs_fallback() -> PathBuf {
+/// Returns the user's home directory, or `.` if `HOME` is unset.
+fn home_dir() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from)
 }
 
@@ -147,16 +156,31 @@ mod tests {
 
     #[test]
     fn default_config_has_palace_path() {
-        let config = MempalaceConfig::default();
-        let path_str = config.palace_path.to_string_lossy();
+        // Test the default palace path formula directly: MempalaceConfig::default()
+        // calls config_dir() which may return MEMPALACE_DIR when set by the test runner.
+        let path = home_dir().join(".mempalace").join("palace.db");
+        let path_str = path.to_string_lossy();
         assert!(path_str.contains(".mempalace"));
         assert!(path_str.ends_with("palace.db"));
     }
 
     #[test]
     fn config_dir_ends_with_mempalace() {
-        let directory = config_dir();
+        // Test the default path formula directly: config_dir() returns MEMPALACE_DIR
+        // when set, so we test the fallback formula via home_dir().
+        let directory = home_dir().join(".mempalace");
         assert!(directory.to_string_lossy().ends_with(".mempalace"));
+    }
+
+    #[test]
+    fn config_dir_respects_mempalace_dir_env_var() {
+        // Verify that MEMPALACE_DIR overrides the default path. temp_env safely
+        // sets the var for this test and restores the previous value afterwards,
+        // preventing interference with concurrent tests.
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        temp_env::with_var("MEMPALACE_DIR", Some(dir.path()), || {
+            assert_eq!(config_dir(), dir.path());
+        });
     }
 
     #[test]

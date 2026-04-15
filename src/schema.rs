@@ -143,3 +143,89 @@ pub async fn ensure_schema(connection: &Connection) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+// Acceptable in tests: .expect() produces immediate, clear failures.
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const EXPECTED_TABLES: &[&str] = &[
+        "compressed",
+        "drawer_words",
+        "drawers",
+        "entities",
+        "explicit_tunnels",
+        "triples",
+    ];
+
+    #[tokio::test]
+    async fn ensure_schema_creates_all_tables() {
+        let (_db, conn) = crate::test_helpers::test_db().await;
+
+        let rows = crate::db::query_all(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+            (),
+        )
+        .await
+        .expect("sqlite_master query should succeed after ensure_schema");
+
+        let table_names: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.get::<String>(0).ok())
+            .collect();
+
+        // All 6 core tables must be present.
+        for &expected in EXPECTED_TABLES {
+            assert!(
+                table_names.contains(&expected.to_string()),
+                "table '{expected}' must exist after ensure_schema"
+            );
+        }
+        assert!(
+            table_names.len() >= EXPECTED_TABLES.len(),
+            "at least {} tables should exist, found {}",
+            EXPECTED_TABLES.len(),
+            table_names.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_schema_idempotent() {
+        let (_db, conn) = crate::test_helpers::test_db().await;
+
+        // Record the table count after the first ensure_schema (called by test_db).
+        let count_query = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'";
+        let rows_before = crate::db::query_all(&conn, count_query, ())
+            .await
+            .expect("table count query before second call should succeed");
+        let count_before: i64 = rows_before[0]
+            .get(0)
+            .expect("COUNT(*) column 0 should be readable as i64");
+        let expected_table_count =
+            i64::try_from(EXPECTED_TABLES.len()).expect("table count fits in i64");
+        assert!(
+            count_before >= expected_table_count,
+            "at least {} core tables should exist before second call, got {count_before}",
+            EXPECTED_TABLES.len()
+        );
+
+        // Call ensure_schema a second time — must not add tables.
+        ensure_schema(&conn)
+            .await
+            .expect("second ensure_schema call should succeed (idempotent)");
+
+        let rows_after = crate::db::query_all(&conn, count_query, ())
+            .await
+            .expect("table count query after second call should succeed");
+        let count_after: i64 = rows_after[0]
+            .get(0)
+            .expect("COUNT(*) column 0 should be readable as i64");
+
+        assert_eq!(
+            count_before, count_after,
+            "ensure_schema must not add or remove tables on second call"
+        );
+    }
+}
