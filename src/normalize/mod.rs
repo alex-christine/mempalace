@@ -168,4 +168,205 @@ mod tests {
         assert!(result.contains("> hello"));
         // TempDir auto-cleans up when dropped
     }
+
+    #[test]
+    fn normalize_file_not_found_returns_error() {
+        // normalize must return Err when the file does not exist.
+        // Use a temp directory to produce a deterministic nonexistent path.
+        let temp_directory =
+            tempfile::tempdir().expect("failed to create temporary directory for not-found test");
+        let nonexistent_path = temp_directory.path().join("no_such_file.txt");
+        let result = normalize(&nonexistent_path);
+        assert!(result.is_err(), "missing file must return Err");
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.to_string().contains("not found")),
+            "error must mention 'not found'"
+        );
+    }
+
+    #[test]
+    fn normalize_empty_file_returns_ok_empty() {
+        // An empty file must normalize to an empty string without error.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("empty.txt");
+        std::fs::write(&path, "").expect("write empty file");
+        let result = normalize(&path).expect("empty file must return Ok");
+        assert!(
+            result.is_empty(),
+            "empty file content must normalize to empty string"
+        );
+        assert_eq!(result.len(), 0, "result length must be zero");
+    }
+
+    #[test]
+    fn normalize_plain_text_passthrough() {
+        // Plain text (not JSON, not enough > markers) must be returned as-is.
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("plain.txt");
+        let content = "This is just plain text content.\nNo JSON, no > markers here at all.\n";
+        std::fs::write(&path, content).expect("write plain text file");
+        let result = normalize(&path).expect("plain text must return Ok");
+        // Exact equality after trim: normalize trims whitespace but must not alter content.
+        assert_eq!(
+            result.trim(),
+            content.trim(),
+            "normalized plain text must exactly equal the original trimmed content"
+        );
+        assert!(!result.is_empty(), "plain text result must not be empty");
+    }
+
+    #[test]
+    fn normalize_unrecognized_json_returns_raw_content() {
+        // Valid JSON that does not match any known chat format (Claude Code, Codex,
+        // Claude AI, ChatGPT, Slack) must fall through and return the raw content.
+        // Table-driven: each case uses a different JSON shape and file extension to
+        // exercise distinct code paths (.json extension vs content-sniffing).
+        let temp_directory = tempfile::tempdir()
+            .expect("failed to create temporary directory for unrecognized-JSON test");
+        let cases: &[(&str, &str)] = &[
+            // (.json extension — triggers extension-based JSON path)
+            (
+                "unknown.json",
+                r#"{"unknown_key": "value", "data": [1, 2, 3]}"#,
+            ),
+            // (.json extension — different JSON shape)
+            (
+                "weather.json",
+                r#"{"weather": "sunny", "temperature": 72, "units": "fahrenheit"}"#,
+            ),
+            // (non-.json extension — triggers content-sniffing via `content.starts_with('{')`)
+            (
+                "config.txt",
+                r#"{"sniffed_key": "detected by content start", "value": true}"#,
+            ),
+        ];
+        for &(filename, json_content) in cases {
+            let filepath = temp_directory.path().join(filename);
+            std::fs::write(&filepath, json_content)
+                .expect("failed to write unrecognized JSON test file");
+            let result =
+                normalize(&filepath).expect("normalize must succeed for unrecognized JSON");
+            assert!(
+                !result.is_empty(),
+                "result must not be empty for {filename}"
+            );
+            assert_eq!(
+                result.trim(),
+                json_content.trim(),
+                "unrecognized JSON must be returned as raw content unchanged ({filename})"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_two_quote_lines_do_not_short_circuit() {
+        // Fewer than 3 lines starting with > must not short-circuit to the
+        // transcript passthrough; format detection runs but finds no match,
+        // so the raw content is returned unchanged (after trim).
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let path = temp_dir.path().join("two_quotes.txt");
+        let content = "> first line\n> second line\nplain text here";
+        std::fs::write(&path, content).expect("write two-quote file");
+        let result = normalize(&path).expect("two-quote file must return Ok");
+        assert_eq!(
+            result.trim(),
+            content.trim(),
+            "content with only two > lines must be returned unchanged"
+        );
+        assert!(!result.is_empty(), "result must not be empty");
+    }
+
+    #[test]
+    fn normalize_jsonl_extension_triggers_json_path() {
+        // A .jsonl file with Claude Code JSONL content must be detected via the
+        // extension check even though .jsonl is not .json. This exercises the
+        // `extension == "jsonl"` branch in normalize().
+        let temp_directory =
+            tempfile::tempdir().expect("failed to create temporary directory for normalize test");
+        let filepath = temp_directory.path().join("conversation.jsonl");
+        let content = r#"{"type":"human","message":{"content":"hello from jsonl"}}
+{"type":"assistant","message":{"content":"reply from assistant"}}"#;
+        std::fs::write(&filepath, content).expect("failed to write .jsonl test file");
+        let result = normalize(&filepath).expect("normalize must succeed for valid .jsonl file");
+        // The Claude Code JSONL parser must have matched; verify transcript markers.
+        assert!(
+            result.contains("> hello from jsonl"),
+            "user turn must be prefixed with > marker"
+        );
+        assert!(
+            result.contains("reply from assistant"),
+            "assistant turn must appear in transcript"
+        );
+    }
+
+    #[test]
+    fn normalize_json_content_without_json_extension() {
+        // A file without .json/.jsonl extension but whose content starts with '{'
+        // must still trigger the JSON detection path. This exercises the
+        // `content.starts_with('{')` branch.
+        let temp_directory =
+            tempfile::tempdir().expect("failed to create temporary directory for normalize test");
+        let filepath = temp_directory.path().join("conversation.txt");
+        // Claude AI format as a JSON object — starts with '{' but has .txt extension.
+        let content = r#"{"messages":[{"role":"user","content":"detected by content"},{"role":"assistant","content":"yes indeed"}]}"#;
+        std::fs::write(&filepath, content).expect("failed to write JSON-content .txt test file");
+        let result = normalize(&filepath).expect("normalize must succeed for JSON content in .txt");
+        assert!(
+            result.contains("> detected by content"),
+            "user turn must be parsed from JSON content in non-.json file"
+        );
+        assert!(
+            result.contains("yes indeed"),
+            "assistant turn must be parsed from JSON content in non-.json file"
+        );
+    }
+
+    #[test]
+    fn normalize_json_array_content_without_json_extension() {
+        // A file without .json extension but whose content starts with '[' must
+        // still trigger the JSON detection path. This exercises the
+        // `content.starts_with('[')` branch.
+        let temp_directory =
+            tempfile::tempdir().expect("failed to create temporary directory for normalize test");
+        let filepath = temp_directory.path().join("chat.log");
+        // Claude AI flat array format — starts with '[' but has .log extension.
+        let content = r#"[{"role":"user","content":"array start"},{"role":"assistant","content":"array reply"}]"#;
+        std::fs::write(&filepath, content).expect("failed to write JSON-array .log test file");
+        let result = normalize(&filepath).expect("normalize must succeed for JSON array in .log");
+        assert!(
+            result.contains("> array start"),
+            "user turn must be parsed from JSON array in non-.json file"
+        );
+        assert!(
+            result.contains("array reply"),
+            "assistant turn must be parsed from JSON array in non-.json file"
+        );
+    }
+
+    #[test]
+    fn normalize_file_too_large_returns_error() {
+        // Files exceeding the 500 MB safety limit must be rejected. Create a sparse
+        // file (no disk space consumed) whose metadata reports a size above MAX_SIZE.
+        let temp_directory =
+            tempfile::tempdir().expect("failed to create temporary directory for size-limit test");
+        let filepath = temp_directory.path().join("huge.json");
+        let file = std::fs::File::create(&filepath)
+            .expect("failed to create sparse file for size-limit test");
+        // 500 MB + 1 byte exceeds the MAX_SIZE constant (500 * 1024 * 1024).
+        file.set_len(500 * 1024 * 1024 + 1)
+            .expect("failed to set sparse file length above MAX_SIZE");
+        drop(file);
+
+        let result = normalize(&filepath);
+        assert!(result.is_err(), "file exceeding 500 MB must be rejected");
+        assert!(
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("too large")),
+            "error message must mention 'too large'"
+        );
+    }
 }

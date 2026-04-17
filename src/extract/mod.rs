@@ -448,4 +448,233 @@ mod tests {
         assert!(!memories.is_empty());
         assert_eq!(memories[0].kind, "emotional");
     }
+
+    #[test]
+    fn test_extract_preference() {
+        // Preference markers like "I prefer" and "always use" must classify as preference.
+        let text = "I prefer snake_case for all variable names. I always use functional style over imperative when possible.";
+        let memories = extract_memories(text, 0.1);
+        assert!(
+            !memories.is_empty(),
+            "preference text must produce at least one memory"
+        );
+        assert_eq!(
+            memories[0].kind, "preference",
+            "text with preference markers must classify as preference"
+        );
+    }
+
+    #[test]
+    fn test_extract_unresolved_problem() {
+        // A problem description without resolution words must stay classified as "problem".
+        let text = "The bug is causing the database connection to crash repeatedly. The system keeps failing under load and we need to investigate further.";
+        let memories = extract_memories(text, 0.1);
+        assert!(
+            !memories.is_empty(),
+            "problem text must produce at least one memory"
+        );
+        assert_eq!(
+            memories[0].kind, "problem",
+            "unresolved problem text must classify as problem, not milestone"
+        );
+    }
+
+    #[test]
+    fn test_short_segments_are_skipped() {
+        // Segments shorter than 20 characters must be skipped entirely.
+        let text = "Too short.";
+        let memories = extract_memories(text, 0.0);
+        assert!(
+            memories.is_empty(),
+            "segments under 20 characters must be skipped"
+        );
+        // Verify the threshold boundary: exactly 20 chars or just under.
+        let text_19 = "1234567890123456789";
+        assert_eq!(text_19.trim().len(), 19);
+        let memories_19 = extract_memories(text_19, 0.0);
+        assert!(
+            memories_19.is_empty(),
+            "19-character segment must be skipped"
+        );
+        // Boundary case: exactly 20 characters must NOT be skipped by the length
+        // filter. Uses "let's use" which matches the decision regex pattern.
+        let text_20 = "Let's use this tool.";
+        assert_eq!(
+            text_20.trim().len(),
+            20,
+            "test string must be exactly 20 chars"
+        );
+        let memories_20 = extract_memories(text_20, 0.0);
+        assert!(
+            !memories_20.is_empty(),
+            "20-character segment with keywords must not be skipped by the length filter"
+        );
+    }
+
+    #[test]
+    fn test_extract_prose_all_code_falls_back_to_full_text() {
+        // When all lines are code (matching code patterns), extract_prose falls
+        // back to returning the original text so scoring can still proceed.
+        let code_only = "```\nlet x = 1;\nlet y = 2;\n```";
+        let result = extract_prose(code_only);
+        // All lines are either code fences or inside a code block, so prose is
+        // empty and the function falls back to the original text.
+        assert!(
+            !result.is_empty(),
+            "extract_prose must return original text when no prose lines found"
+        );
+        assert!(
+            result.contains("let x = 1"),
+            "fallback must contain original code content"
+        );
+    }
+
+    #[test]
+    fn test_large_single_block_is_chunked() {
+        // A single paragraph (no blank lines) exceeding 20 lines must be split
+        // into chunks of 25 lines by the line-group fallback in split_into_segments.
+        let lines: Vec<String> = (0..30)
+            .map(|i| format!("Line number {i} with some padding text to make it longer"))
+            .collect();
+        let text = lines.join("\n");
+        let segments = split_into_segments(&text);
+        // 30 lines with no blank line separators and no turn markers: should chunk.
+        assert!(
+            segments.len() >= 2,
+            "30-line single block must be split into at least 2 chunks"
+        );
+        // Each chunk must be non-empty.
+        assert!(
+            segments.iter().all(|segment| !segment.trim().is_empty()),
+            "all chunks must be non-empty"
+        );
+    }
+
+    #[test]
+    fn test_disambiguate_problem_positive_milestone() {
+        // A problem with resolution markers but no emotional markers must be
+        // reclassified as "milestone". The `disambiguate` function checks
+        // `has_resolution` first; when emotional score is 0 it returns "milestone".
+        // Avoid emotional keywords (proud, love, joy) to stay off the emotional branch.
+        let text = "The bug was terrible but the issue was finally fixed and it works after the long struggle.";
+        let memories = extract_memories(text, 0.1);
+        assert!(
+            !memories.is_empty(),
+            "text must produce at least one memory"
+        );
+        // "works" and "fixed" trigger has_resolution; no emotional keywords means
+        // the emotional score is 0, so disambiguate returns "milestone".
+        let kind = &memories[0].kind;
+        assert_eq!(
+            kind, "milestone",
+            "resolved problem without emotional cues must be reclassified as milestone, got: {kind}"
+        );
+    }
+
+    #[test]
+    fn test_high_confidence_threshold_filters_low_scores() {
+        // A very high min_confidence (1.0) should filter out memories that don't
+        // have extremely high marker scores relative to the 5.0 divisor.
+        let text =
+            "We decided to use a new approach for the architecture because of the trade-off.";
+        let memories_low = extract_memories(text, 0.1);
+        let memories_high = extract_memories(text, 1.0);
+        // With low threshold, the decision markers should produce a memory.
+        assert!(
+            !memories_low.is_empty(),
+            "low threshold must produce memories from decision text"
+        );
+        // With maximum threshold (1.0), most text is filtered out since
+        // confidence = (score / 5.0).min(1.0) requires score >= 5.0.
+        assert!(
+            memories_high.len() <= memories_low.len(),
+            "high threshold must produce fewer or equal memories than low threshold"
+        );
+    }
+
+    #[test]
+    fn test_chunk_index_sequential() {
+        // Extracted memories must have sequential chunk_index values starting at 0.
+        let text = "> What do you prefer?\nI prefer tabs over spaces always.\n\n> Any milestones?\nWe finally shipped version 2.0 and deployed it successfully.";
+        let memories = extract_memories(text, 0.1);
+        // Guard: at least one memory must be produced for the loop to be meaningful.
+        assert!(
+            !memories.is_empty(),
+            "text with preference and milestone markers must produce at least one memory"
+        );
+        // Verify sequential indexing for however many memories are extracted.
+        for (index, memory) in memories.iter().enumerate() {
+            assert_eq!(
+                memory.chunk_index, index,
+                "chunk_index must be sequential; expected {index}, got {}",
+                memory.chunk_index
+            );
+        }
+        // Postcondition: all memories have non-empty content and kind.
+        assert!(
+            memories.iter().all(|memory| !memory.content.is_empty()),
+            "all memories must have non-empty content"
+        );
+        assert!(
+            memories.iter().all(|memory| !memory.kind.is_empty()),
+            "all memories must have non-empty kind"
+        );
+    }
+
+    #[test]
+    fn test_score_markers_returns_zero_for_no_matches() {
+        // Text with no matching markers must produce a score of 0.0.
+        let text = "the quick brown fox jumps over the lazy dog";
+        let score = score_markers(text, DECISION_REGEXES.as_slice());
+        assert!(
+            (score - 0.0).abs() < f64::EPSILON,
+            "non-matching text must score 0.0"
+        );
+        // Also verify against emotion markers for cross-type coverage.
+        let emotion_score = score_markers(text, EMOTION_REGEXES.as_slice());
+        assert!(
+            (emotion_score - 0.0).abs() < f64::EPSILON,
+            "non-matching text must score 0.0 for emotion markers"
+        );
+    }
+
+    #[test]
+    fn test_disambiguate_non_problem_passes_through() {
+        // Non-problem types must pass through disambiguate unchanged regardless
+        // of sentiment or resolution words.
+        let scores: std::collections::HashMap<&str, f64> =
+            [("decision", 3.0), ("milestone", 1.0)].into();
+        let result = disambiguate("decision", "we fixed the breakthrough", &scores);
+        assert_eq!(
+            result, "decision",
+            "non-problem type must not be reclassified"
+        );
+        // Also verify emotional passes through unchanged.
+        let result_emotional = disambiguate("emotional", "we fixed it", &scores);
+        assert_eq!(
+            result_emotional, "emotional",
+            "emotional type must not be reclassified by disambiguate"
+        );
+    }
+
+    #[test]
+    fn test_has_resolution_patterns() {
+        // Additional resolution patterns must be detected correctly.
+        assert!(
+            has_resolution("I patched the config file"),
+            "'patched' must be detected as resolution"
+        );
+        assert!(
+            has_resolution("We got it working after three tries"),
+            "'got it working' must be detected as resolution"
+        );
+        assert!(
+            has_resolution("She nailed it on the first attempt"),
+            "'nailed it' must be detected as resolution"
+        );
+        assert!(
+            has_resolution("The answer was to restart the service"),
+            "'the answer' must be detected as resolution"
+        );
+    }
 }
