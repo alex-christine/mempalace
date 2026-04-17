@@ -170,6 +170,54 @@ fn sanitize_name(value: &str, field_name: &str) -> Result<String, Value> {
     Ok(result)
 }
 
+/// Validate a knowledge-graph entity value (subject or object).
+///
+/// More permissive than `sanitize_name` — allows punctuation such as commas,
+/// colons, and parentheses that are common in natural-language KG values.
+/// Rejects null bytes, path-traversal sequences (`..`, `/`, `\`), and
+/// over-length strings.
+///
+/// Note: `/` is still rejected, so namespaced IRIs (e.g. `schema:Person`) are
+/// allowed but URI paths (e.g. `http://example.org/Person`) are not. If IRI
+/// support is ever needed, introduce a dedicated validator rather than relaxing
+/// this one.
+///
+/// Not used for wing/room names (filesystem constraints) or predicates
+/// (which should be simple relationship identifiers).
+fn sanitize_kg_value(value: &str, field_name: &str) -> Result<String, Value> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(
+            json!({"success": false, "error": format!("{field_name} must be a non-empty string"), "public": true}),
+        );
+    }
+    if trimmed.chars().count() > 128 {
+        return Err(
+            json!({"success": false, "error": format!("{field_name} exceeds maximum length of 128 characters"), "public": true}),
+        );
+    }
+    if trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\x00')
+    {
+        return Err(
+            json!({"success": false, "error": format!("{field_name} contains invalid characters"), "public": true}),
+        );
+    }
+    let result = trimmed.to_string();
+
+    // Postconditions: result is non-empty, trimmed, and has no path-traversal chars.
+    debug_assert!(!result.is_empty());
+    debug_assert!(result == result.trim());
+    debug_assert!(!result.contains(".."));
+    debug_assert!(!result.contains('/'));
+    debug_assert!(!result.contains('\\'));
+    debug_assert!(!result.contains('\0'));
+
+    Ok(result)
+}
+
 /// Validate an optional name filter.
 ///
 /// Returns `Ok(None)` if the value is empty/whitespace-only, `Ok(Some(trimmed))`
@@ -468,6 +516,7 @@ async fn tool_search(connection: &Connection, args: &Value) -> Value {
                         "room": r.room,
                         "content": r.text,
                         "source_file": r.source_file,
+                        "created_at": r.created_at,
                         "similarity": r.relevance,
                     })
                 })
@@ -949,7 +998,7 @@ async fn tool_update_drawer(connection: &Connection, args: &Value) -> Value {
 }
 
 async fn tool_kg_query(connection: &Connection, args: &Value) -> Value {
-    let entity = match sanitize_name(str_arg(args, "entity"), "entity") {
+    let entity = match sanitize_kg_value(str_arg(args, "entity"), "entity") {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -999,7 +1048,7 @@ async fn tool_kg_add(connection: &Connection, args: &Value) -> Value {
         }
     };
 
-    let subject = match sanitize_name(subject, "subject") {
+    let subject = match sanitize_kg_value(subject, "subject") {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1007,10 +1056,7 @@ async fn tool_kg_add(connection: &Connection, args: &Value) -> Value {
         Ok(v) => v,
         Err(e) => return e,
     };
-    // `sanitize_name` intentionally restricts objects to [a-zA-Z0-9_ .'-].
-    // If KG identifiers ever need ':', '@', or '/' (e.g. for namespaced IRIs),
-    // introduce a dedicated `sanitize_kg_object` rather than relaxing this one.
-    let object = match sanitize_name(object, "object") {
+    let object = match sanitize_kg_value(object, "object") {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1064,7 +1110,7 @@ async fn tool_kg_invalidate(connection: &Connection, args: &Value) -> Value {
         }
     };
 
-    let subject = match sanitize_name(subject, "subject") {
+    let subject = match sanitize_kg_value(subject, "subject") {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1072,7 +1118,7 @@ async fn tool_kg_invalidate(connection: &Connection, args: &Value) -> Value {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let object = match sanitize_name(object, "object") {
+    let object = match sanitize_kg_value(object, "object") {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1098,9 +1144,16 @@ async fn tool_kg_invalidate(connection: &Connection, args: &Value) -> Value {
 }
 
 async fn tool_kg_timeline(connection: &Connection, args: &Value) -> Value {
-    let entity = match sanitize_opt_name(str_arg(args, "entity"), "entity") {
-        Ok(v) => v,
-        Err(e) => return e,
+    let entity = {
+        let raw_entity = str_arg(args, "entity").trim();
+        if raw_entity.is_empty() {
+            None
+        } else {
+            match sanitize_kg_value(raw_entity, "entity") {
+                Ok(v) => Some(v),
+                Err(e) => return e,
+            }
+        }
     };
 
     match kg::query::timeline(connection, entity.as_deref()).await {
@@ -1691,6 +1744,83 @@ mod tests {
             let result = tool_search(&connection, &json!({"query": "rust programming"})).await;
             assert!(result.get("error").is_none(), "search must not error");
             assert!(result["count"].as_i64().expect("count must be int") >= 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn search_results_include_created_at() {
+        // Each search result must include a created_at key that maps to a JSON
+        // string. The value may be empty for legacy rows where filed_at was not
+        // recorded (SearchResult.created_at uses unwrap_or_default), so only
+        // the type is asserted here, not non-emptiness.
+        with_isolated_env(|connection| async move {
+            seed_drawer(
+                &connection,
+                "tech",
+                "rust",
+                "rust programming language memory safety",
+            )
+            .await;
+
+            let result = tool_search(&connection, &json!({"query": "rust programming"})).await;
+            assert!(result.get("error").is_none(), "search must not error");
+            let results = result["results"].as_array().expect("results must be array");
+            assert!(!results.is_empty(), "must have at least one result");
+            for r in results {
+                // Assert the key is present and is a JSON string (may be empty).
+                assert!(
+                    r["created_at"].is_string(),
+                    "created_at must be a string in each result"
+                );
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn search_results_created_at_empty_for_legacy_row() {
+        // A drawer with filed_at = NULL (legacy row — filed_at was added after
+        // initial schema) must still appear in search results. created_at must
+        // be an empty string (unwrap_or_default of None), not an error.
+        with_isolated_env(|connection| async move {
+            seed_drawer(
+                &connection,
+                "tech",
+                "rust",
+                "rust programming language memory safety",
+            )
+            .await;
+
+            // Null out filed_at to simulate a row from before the column existed.
+            connection
+                .execute("UPDATE drawers SET filed_at = NULL", ())
+                .await
+                .expect("UPDATE filed_at to NULL must succeed");
+
+            let result = tool_search(&connection, &json!({"query": "rust programming"})).await;
+            assert!(
+                result.get("error").is_none(),
+                "search must not error for legacy row"
+            );
+            let results = result["results"].as_array().expect("results must be array");
+            assert!(
+                !results.is_empty(),
+                "legacy row must appear in search results"
+            );
+            for r in results {
+                assert!(
+                    r["created_at"].is_string(),
+                    "created_at must be a string even when filed_at is NULL"
+                );
+                let created_at = r["created_at"]
+                    .as_str()
+                    .expect("created_at must be a JSON string");
+                assert_eq!(
+                    created_at, "",
+                    "created_at must be empty string when filed_at is NULL"
+                );
+            }
         })
         .await;
     }
@@ -2556,6 +2686,82 @@ mod tests {
             );
         })
         .await;
+    }
+
+    // --- sanitize_kg_value ---
+
+    #[test]
+    fn sanitize_kg_value_allows_natural_language_punctuation() {
+        // Commas, colons, and parentheses are common in KG entity values.
+        for input in &[
+            "Alice, Bob",
+            "type: Person",
+            "born in (1990)",
+            "co-founder",
+            "O'Brien",
+            "Dr. Smith",
+        ] {
+            let result = sanitize_kg_value(input, "entity");
+            assert!(result.is_ok(), "expected Ok for '{input}', got {result:?}");
+            assert_eq!(
+                result.expect("sanitize_kg_value must accept valid input"),
+                input.trim()
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_kg_value_trims_whitespace() {
+        let result = sanitize_kg_value("  Alice  ", "entity");
+        assert_eq!(result.expect("whitespace trimming must succeed"), "Alice");
+    }
+
+    #[test]
+    fn sanitize_kg_value_unicode_boundary() {
+        // Exactly 128 Unicode characters (each is 3 bytes) must be accepted;
+        // 129 must be rejected.
+        let char_128: String = "あ".repeat(128);
+        let char_129: String = "あ".repeat(129);
+        assert_eq!(char_128.chars().count(), 128);
+        assert_eq!(char_129.chars().count(), 129);
+        assert!(
+            sanitize_kg_value(&char_128, "entity").is_ok(),
+            "128-char Unicode must be accepted"
+        );
+        let err = sanitize_kg_value(&char_129, "entity");
+        assert!(err.is_err(), "129-char Unicode must be rejected");
+        assert!(
+            err.expect_err("129-char input must be rejected")["error"]
+                .as_str()
+                .expect("error must be string")
+                .contains("128"),
+            "error must mention limit"
+        );
+    }
+
+    #[test]
+    fn sanitize_kg_value_rejects_path_traversal_and_null() {
+        let disallowed = [
+            ("..", "dotdot"),
+            ("/", "slash"),
+            ("\\", "backslash"),
+            ("\0", "null"),
+        ];
+        for (input, label) in &disallowed {
+            let result = sanitize_kg_value(&format!("value{input}here"), "entity");
+            assert!(result.is_err(), "expected Err for {label}");
+            let error_json = result.expect_err("disallowed input must be rejected");
+            assert!(
+                error_json["public"].as_bool().unwrap_or(false),
+                "error must be public for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_kg_value_rejects_empty_and_whitespace_only() {
+        assert!(sanitize_kg_value("", "entity").is_err());
+        assert!(sanitize_kg_value("   ", "entity").is_err());
     }
 
     // --- get_aaak_spec (via dispatch) ---

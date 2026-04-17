@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use turso::Connection;
 
-use crate::config::ProjectConfig;
+use crate::config::{ProjectConfig, RoomConfig};
 use crate::error::Result;
 use crate::palace::chunker::chunk_text;
 use crate::palace::drawer;
@@ -34,15 +34,22 @@ const READABLE_EXTENSIONS: &[&str] = &[
     "lua", "r", "php", "pl", "zig", "nim", "ex", "exs", "erl", "hs", "ml",
 ];
 
-const SKIP_FILES: &[&str] = &[
+/// Config filenames recognised by the miner, in load-precedence order.
+/// Single source of truth: referenced by both `mine_load_config` and `is_skip_file`.
+pub const PROJECT_CONFIG_FILES: &[&str] = &[
     "mempalace.yaml",
     "mempalace.yml",
     "mempal.yaml",
     "mempal.yml",
-    ".gitignore",
-    "package-lock.json",
-    "Cargo.lock",
 ];
+
+/// Non-config files that are always excluded from mining.
+const SKIP_FILES_EXTRA: &[&str] = &[".gitignore", "package-lock.json", "Cargo.lock"];
+
+/// Return `true` if a filename should be excluded from mining.
+fn is_skip_file(name: &str) -> bool {
+    PROJECT_CONFIG_FILES.contains(&name) || SKIP_FILES_EXTRA.contains(&name)
+}
 
 /// Scan a project directory for all readable files.
 pub fn scan_project_with_opts(project_dir: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
@@ -102,7 +109,7 @@ fn walk_dir_gitignore(project_dir: &Path) -> Vec<PathBuf> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        if SKIP_FILES.contains(&name.as_str()) {
+        if is_skip_file(name.as_str()) {
             continue;
         }
 
@@ -153,7 +160,7 @@ fn walk_dir(directory: &Path, files: &mut Vec<PathBuf>) {
             } else if let Some(extension) = path.extension() {
                 let extension_lower = extension.to_string_lossy().to_lowercase();
                 if READABLE_EXTENSIONS.contains(&extension_lower.as_str())
-                    && !SKIP_FILES.contains(&name.as_str())
+                    && !is_skip_file(name.as_str())
                 {
                     if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_FILE_SIZE) {
                         continue;
@@ -351,6 +358,68 @@ async fn mine_process_files(
     ))
 }
 
+/// Load project config from `project_dir`, trying config file names in precedence
+/// order: `mempalace.yaml`, `mempalace.yml`, `mempal.yaml`, `mempal.yml`. If none
+/// exist, emits a warning to stderr and synthesises a default config.
+///
+/// `override_wing` is the wing name from `--wing` on the command line. When no
+/// config file is found and the directory has no basename (e.g. `/`), the override
+/// is used instead of failing — so `mempalace mine / --wing myproject` succeeds.
+///
+/// This mirrors the Python behaviour introduced in PR #604: directories without a
+/// config file can still be mined instead of aborting with an error.
+fn mine_load_config(project_dir: &Path, override_wing: Option<&str>) -> Result<ProjectConfig> {
+    for name in PROJECT_CONFIG_FILES {
+        let path = project_dir.join(name);
+        if path.exists() {
+            return ProjectConfig::load(&path);
+        }
+    }
+
+    // Neither config file found — warn and fall back to auto-detected defaults so
+    // mining can proceed without requiring an explicit `mempalace init` step.
+    //
+    // Wing resolution order: explicit --wing override, then directory basename.
+    let wing_name = if let Some(wing) = override_wing {
+        let trimmed = wing.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(crate::error::Error::Other(
+                "--wing override must not be empty or whitespace-only".to_string(),
+            ));
+        }
+        trimmed
+    } else {
+        let inferred = project_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if inferred.is_empty() {
+            return Err(crate::error::Error::Other(format!(
+                "cannot infer wing name: {} has no basename; \
+                 add mempalace.yaml with an explicit wing name",
+                project_dir.display()
+            )));
+        }
+        inferred
+    };
+    eprintln!(
+        "  No mempalace.yaml/.yml found in {} \
+         — using auto-detected defaults (wing='{wing_name}'). \
+         Directories with the same basename will share a wing; \
+         add mempalace.yaml to disambiguate.",
+        project_dir.display()
+    );
+    Ok(ProjectConfig {
+        wing: wing_name,
+        rooms: vec![RoomConfig {
+            name: "general".to_string(),
+            description: "All project files".to_string(),
+            keywords: vec![],
+        }],
+    })
+}
+
 /// Mine a project directory into the palace.
 pub async fn mine(connection: &Connection, project_dir: &Path, opts: &MineParams) -> Result<()> {
     if !project_dir.is_dir() {
@@ -367,10 +436,18 @@ pub async fn mine(connection: &Connection, project_dir: &Path, opts: &MineParams
         ))
     })?;
 
-    let config_path = project_dir.join("mempalace.yaml");
-    let config = ProjectConfig::load(&config_path)?;
+    // Normalize the wing override: trim whitespace and treat empty/whitespace-only
+    // values as no override, falling back to config or directory basename.
+    let normalized_wing: Option<String> = opts
+        .wing
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(str::to_string);
 
-    let wing = opts.wing.as_deref().unwrap_or(&config.wing);
+    let config = mine_load_config(&project_dir, normalized_wing.as_deref())?;
+
+    let wing = normalized_wing.as_deref().unwrap_or(&config.wing);
     let mut rooms = config.rooms;
     if rooms.is_empty() {
         // Empty rooms list in mempalace.yaml would violate detect_room's precondition;
@@ -567,6 +644,123 @@ mod tests {
         );
     }
 
+    // --- mine_load_config ---
+
+    #[test]
+    fn mine_load_config_loads_primary_yaml() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(
+            dir.path().join("mempalace.yaml"),
+            "wing: primary\nrooms:\n  - name: main\n    description: ''\n",
+        )
+        .expect("write mempalace.yaml should succeed");
+        let config = mine_load_config(dir.path(), None).expect("should load primary yaml");
+        assert_eq!(config.wing, "primary");
+        assert_eq!(config.rooms.len(), 1);
+        assert_eq!(config.rooms[0].name, "main");
+    }
+
+    #[test]
+    fn mine_load_config_precedence_yaml_over_yml() {
+        // mempalace.yaml must take precedence over mempalace.yml.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(
+            dir.path().join("mempalace.yaml"),
+            "wing: from-yaml\nrooms:\n  - name: r\n    description: ''\n",
+        )
+        .expect("write .yaml should succeed");
+        std::fs::write(
+            dir.path().join("mempalace.yml"),
+            "wing: from-yml\nrooms:\n  - name: r\n    description: ''\n",
+        )
+        .expect("write .yml should succeed");
+        let config = mine_load_config(dir.path(), None).expect("should load yaml over yml");
+        assert_eq!(config.wing, "from-yaml");
+    }
+
+    #[test]
+    fn mine_load_config_falls_back_to_yml() {
+        // mempalace.yml is used when the .yaml variant is absent.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(
+            dir.path().join("mempalace.yml"),
+            "wing: yml-wing\nrooms:\n  - name: r\n    description: ''\n",
+        )
+        .expect("write mempalace.yml should succeed");
+        let config = mine_load_config(dir.path(), None).expect("should load .yml");
+        assert_eq!(config.wing, "yml-wing");
+    }
+
+    #[test]
+    fn mine_load_config_synthesises_defaults_when_no_config() {
+        // No config files present — defaults use the directory basename as wing.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config = mine_load_config(dir.path(), None).expect("should synthesise defaults");
+        let expected_wing = dir
+            .path()
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(config.wing, expected_wing);
+        assert_eq!(config.rooms.len(), 1);
+        assert_eq!(config.rooms[0].name, "general");
+    }
+
+    #[test]
+    fn mine_load_config_errors_on_empty_basename() {
+        // Mining a root-like path (no basename) must return Err, not panic.
+        // Use a path whose file_name() is None (e.g. "/").
+        let result = mine_load_config(std::path::Path::new("/"), None);
+        assert!(result.is_err(), "root path must produce an error");
+        let error_message = result
+            .expect_err("root path must produce an error")
+            .to_string();
+        assert!(
+            error_message.contains("basename"),
+            "error must mention basename: {error_message}"
+        );
+    }
+
+    #[test]
+    fn mine_load_config_override_wing_succeeds_on_empty_basename() {
+        // --wing override must be used instead of the basename when the directory
+        // has no basename (e.g. "/"), so `mempalace mine / --wing myproject` succeeds.
+        let config = mine_load_config(std::path::Path::new("/"), Some("myproject"))
+            .expect("override_wing must prevent error on root path");
+        assert_eq!(config.wing, "myproject");
+        assert_eq!(config.rooms[0].name, "general");
+    }
+
+    #[test]
+    fn mine_load_config_override_wing_trims_whitespace() {
+        // Leading/trailing whitespace in --wing must be stripped so that
+        // `mempalace mine . --wing " myproject "` yields wing="myproject".
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let config = mine_load_config(dir.path(), Some("  myproject  "))
+            .expect("trimmed override must succeed");
+        assert_eq!(config.wing, "myproject");
+    }
+
+    #[test]
+    fn mine_load_config_override_wing_rejects_empty() {
+        // An empty --wing override must be an error, not a blank wing name.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let result = mine_load_config(dir.path(), Some(""));
+        assert!(result.is_err(), "empty override must produce an error");
+    }
+
+    #[test]
+    fn mine_load_config_override_wing_rejects_whitespace_only() {
+        // A whitespace-only --wing override must be an error, not a blank wing name.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let result = mine_load_config(dir.path(), Some("   "));
+        assert!(
+            result.is_err(),
+            "whitespace-only override must produce an error"
+        );
+    }
+
     #[test]
     fn scan_project_skips_binary_extensions() {
         // Files with extensions not in READABLE_EXTENSIONS should be excluded.
@@ -595,6 +789,104 @@ mod tests {
         assert!(
             !names.contains(&"image.png".to_string()),
             "Non-readable extension should be excluded"
+        );
+    }
+
+    // --- mine() wing normalization ---
+
+    const CONFIG_YAML: &str = "wing: config-wing\nrooms:\n  - name: general\n    description: ''\n";
+
+    fn mine_opts(wing: Option<&str>) -> MineParams {
+        MineParams {
+            wing: wing.map(str::to_string),
+            agent: "test".to_string(),
+            limit: 0,
+            dry_run: false,
+            respect_gitignore: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn mine_wing_override_is_trimmed() {
+        // A padded --wing value must be trimmed before drawers are stored, so
+        // `mine . --wing " padded "` yields wing="padded" in the palace.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(dir.path().join("mempalace.yaml"), CONFIG_YAML)
+            .expect("write config should succeed");
+        std::fs::write(
+            dir.path().join("notes.txt"),
+            "rust programming language provides memory safety without a garbage collector",
+        )
+        .expect("write notes.txt should succeed");
+
+        let (_db, connection) = crate::test_helpers::test_db().await;
+        mine(&connection, dir.path(), &mine_opts(Some("  padded  ")))
+            .await
+            .expect("mine must succeed with padded wing");
+
+        let rows = crate::db::query_all(&connection, "SELECT DISTINCT wing FROM drawers", ())
+            .await
+            .expect("query must succeed");
+        assert_eq!(rows.len(), 1, "must have exactly one distinct wing");
+        let stored_wing: String = rows[0].get(0).expect("wing column must be readable");
+        assert_eq!(stored_wing, "padded", "wing must be trimmed");
+    }
+
+    #[tokio::test]
+    async fn mine_wing_whitespace_only_falls_back_to_config() {
+        // A whitespace-only --wing must be treated as no override, so the
+        // config file's wing ("config-wing") is used instead.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(dir.path().join("mempalace.yaml"), CONFIG_YAML)
+            .expect("write config should succeed");
+        std::fs::write(
+            dir.path().join("notes.txt"),
+            "rust programming language provides memory safety without a garbage collector",
+        )
+        .expect("write notes.txt should succeed");
+
+        let (_db, connection) = crate::test_helpers::test_db().await;
+        mine(&connection, dir.path(), &mine_opts(Some("   ")))
+            .await
+            .expect("mine must succeed when whitespace wing falls back to config");
+
+        let rows = crate::db::query_all(&connection, "SELECT DISTINCT wing FROM drawers", ())
+            .await
+            .expect("query must succeed");
+        assert_eq!(rows.len(), 1, "must have exactly one distinct wing");
+        let stored_wing: String = rows[0].get(0).expect("wing column must be readable");
+        assert_eq!(
+            stored_wing, "config-wing",
+            "whitespace-only wing must fall back to config"
+        );
+    }
+
+    #[tokio::test]
+    async fn mine_wing_empty_falls_back_to_config() {
+        // An empty --wing must be treated as no override, so the config file's
+        // wing ("config-wing") is used instead.
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        std::fs::write(dir.path().join("mempalace.yaml"), CONFIG_YAML)
+            .expect("write config should succeed");
+        std::fs::write(
+            dir.path().join("notes.txt"),
+            "rust programming language provides memory safety without a garbage collector",
+        )
+        .expect("write notes.txt should succeed");
+
+        let (_db, connection) = crate::test_helpers::test_db().await;
+        mine(&connection, dir.path(), &mine_opts(Some("")))
+            .await
+            .expect("mine must succeed when empty wing falls back to config");
+
+        let rows = crate::db::query_all(&connection, "SELECT DISTINCT wing FROM drawers", ())
+            .await
+            .expect("query must succeed");
+        assert_eq!(rows.len(), 1, "must have exactly one distinct wing");
+        let stored_wing: String = rows[0].get(0).expect("wing column must be readable");
+        assert_eq!(
+            stored_wing, "config-wing",
+            "empty wing must fall back to config"
         );
     }
 }
